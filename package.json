@@ -19,7 +19,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/frida/frida-itrace.git"
+    "url": "git+https://github.com/frida-packages/frida-itrace.git"
   },
   "authors": [
     "Frida Developers"
