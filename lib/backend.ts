@@ -7,8 +7,9 @@ export const code = `#line 2 "backend.ts"
 
 # define RED_ZONE_SIZE 128
 
-# define SCRATCH_REG_BOTTOM X86_REG_R12
-# define SCRATCH_REG_TOP X86_REG_R15
+# define SESSION_BASE_REG X86_REG_R15
+# define SESSION_BASE_GUM_REG GUM_X86_R15
+# define RESERVED_SLOT_COUNT 4
 
 /* x86_64 TSO makes a compiler barrier sufficient */
 # define memory_barrier() __asm__ volatile ("")
@@ -17,8 +18,8 @@ export const code = `#line 2 "backend.ts"
 
 # define RED_ZONE_SIZE 128
 
-# define SCRATCH_REG_BOTTOM ARM64_REG_X21
-# define SCRATCH_REG_TOP ARM64_REG_X28
+# define SESSION_BASE_REG ARM64_REG_X28
+# define RESERVED_SLOT_COUNT 8
 
 /* dmb ish — full barrier, inner shareable domain */
 # define memory_barrier() __asm__ volatile (".int 0xd5033bbf")
@@ -26,9 +27,6 @@ export const code = `#line 2 "backend.ts"
 #else
 # error "Unsupported architecture"
 #endif
-
-#define SCRATCH_REG_INDEX(r) ((r) - SCRATCH_REG_BOTTOM)
-#define SCRATCH_REG_OFFSET(r) (SCRATCH_REG_INDEX (r) * 8)
 
 #define ITRACE_EVENT_COMPILE 1
 #define ITRACE_EVENT_START   2
@@ -70,10 +68,11 @@ struct _ITraceSession
   guint64 pending_size;
   guint64 saved_regs[2];
   guint64 stack[64];
-  guint64 scratch_regs[SCRATCH_REG_TOP - SCRATCH_REG_BOTTOM + 1];
+  guint64 reserved[RESERVED_SLOT_COUNT];
   guint64 log_buf[1969];
   GumAddress write_impl;
   GumModuleMap * modules;
+  guint64 saved_base;
 };
 
 extern ITraceSession session;
@@ -86,17 +85,12 @@ static void on_end_instruction_hit (GumCpuContext * cpu_context, gpointer user_d
 
 #if defined (HAVE_I386)
 
-static x86_reg pick_scratch_register (cs_regs regs_read, uint8_t num_regs_read, cs_regs regs_written, uint8_t num_regs_written);
 static x86_reg register_to_full_size_register (x86_reg reg);
-static void emit_scratch_register_restore (GumX86Writer * cw, x86_reg reg);
 static void emit_buffer_write_impl (GumX86Writer * cw);
-static GumX86Reg to_gum_reg (x86_reg reg);
 
 #elif defined (HAVE_ARM64)
 
-static arm64_reg pick_scratch_register (cs_regs regs_read, uint8_t num_regs_read, cs_regs regs_written, uint8_t num_regs_written);
 static arm64_reg register_to_full_size_register (arm64_reg reg);
-static void emit_scratch_register_restore (GumArm64Writer * cw, arm64_reg reg);
 static void emit_buffer_write_impl (GumArm64Writer * cw);
 
 #endif
@@ -136,10 +130,8 @@ transform (GumStalkerIterator * iterator,
   GumAddress block_address = 0;
 #if defined (HAVE_I386)
   guint log_buf_offset = 8;
-  x86_reg prev_session_reg = X86_REG_INVALID;
 #else
   guint log_buf_offset = 16;
-  arm64_reg prev_session_reg = ARM64_REG_INVALID;
 #endif
 
   GArray * writes = g_array_new (FALSE, FALSE, sizeof (ITraceBlockWrite));
@@ -169,38 +161,34 @@ transform (GumStalkerIterator * iterator,
     cs_regs regs_read, regs_written;
     uint8_t num_regs_read, num_regs_written;
     cs_regs_access (capstone, insn, regs_read, &num_regs_read, regs_written, &num_regs_written);
-    for (uint8_t i = 0; i != num_regs_read; i++)
-      regs_read[i] = register_to_full_size_register (regs_read[i]);
     for (uint8_t i = 0; i != num_regs_written; i++)
       regs_written[i] = register_to_full_size_register (regs_written[i]);
 
 #if defined (HAVE_I386)
-    x86_reg session_reg = is_last_in_block
-        ? SCRATCH_REG_TOP
-        : pick_scratch_register (regs_read, num_regs_read, regs_written, num_regs_written);
-
-    if (session_reg != prev_session_reg)
-    {
-      if (prev_session_reg != X86_REG_INVALID)
-        gum_x86_writer_put_mov_reg_reg (cw, to_gum_reg (session_reg), to_gum_reg (prev_session_reg));
-      else
-        gum_x86_writer_put_mov_reg_address (cw, to_gum_reg (session_reg), GUM_ADDRESS (&session));
-    }
-
-    if (prev_session_reg != X86_REG_INVALID && session_reg != prev_session_reg)
-      emit_scratch_register_restore (cw, prev_session_reg);
+    x86_reg session_reg = gum_stalker_iterator_get_user_data_reg (iterator);
+    GumX86Reg session_gum = gum_x86_reg_from_capstone (session_reg);
 
     if (is_last_in_block)
     {
-      gum_x86_writer_put_mov_reg_offset_ptr_reg (cw, to_gum_reg (session_reg),
+      gboolean spill_base = session_reg != SESSION_BASE_REG;
+
+      if (spill_base)
+      {
+        gum_x86_writer_put_mov_reg_offset_ptr_reg (cw, session_gum,
+            G_STRUCT_OFFSET (ITraceSession, saved_base), SESSION_BASE_GUM_REG);
+        gum_x86_writer_put_mov_reg_reg (cw, SESSION_BASE_GUM_REG, session_gum);
+        session_gum = SESSION_BASE_GUM_REG;
+      }
+
+      gum_x86_writer_put_mov_reg_offset_ptr_reg (cw, session_gum,
           G_STRUCT_OFFSET (ITraceSession, saved_regs), GUM_X86_RAX);
 
       gum_x86_writer_put_mov_reg_address (cw, GUM_X86_RAX, block_address);
-      gum_x86_writer_put_mov_reg_offset_ptr_reg (cw, to_gum_reg (session_reg),
+      gum_x86_writer_put_mov_reg_offset_ptr_reg (cw, session_gum,
           G_STRUCT_OFFSET (ITraceSession, log_buf), GUM_X86_RAX);
 
       gum_x86_writer_put_mov_reg_address (cw, GUM_X86_RAX, (GumAddress) log_buf_offset);
-      gum_x86_writer_put_mov_reg_offset_ptr_reg (cw, to_gum_reg (session_reg),
+      gum_x86_writer_put_mov_reg_offset_ptr_reg (cw, session_gum,
           G_STRUCT_OFFSET (ITraceSession, pending_size), GUM_X86_RAX);
 
       if (session.write_impl == 0)
@@ -221,26 +209,17 @@ transform (GumStalkerIterator * iterator,
       gum_x86_writer_put_lea_reg_reg_offset (cw, GUM_X86_RSP,
           GUM_X86_RSP, RED_ZONE_SIZE);
 
-      gum_x86_writer_put_mov_reg_reg_offset_ptr (cw, GUM_X86_RAX, to_gum_reg (session_reg),
+      gum_x86_writer_put_mov_reg_reg_offset_ptr (cw, GUM_X86_RAX, session_gum,
           G_STRUCT_OFFSET (ITraceSession, saved_regs));
 
-      emit_scratch_register_restore (cw, session_reg);
+      if (spill_base)
+      {
+        gum_x86_writer_put_mov_reg_reg_offset_ptr (cw, SESSION_BASE_GUM_REG,
+            SESSION_BASE_GUM_REG, G_STRUCT_OFFSET (ITraceSession, saved_base));
+      }
     }
 #else
-    arm64_reg session_reg = is_last_in_block
-        ? SCRATCH_REG_TOP
-        : pick_scratch_register (regs_read, num_regs_read, regs_written, num_regs_written);
-
-    if (session_reg != prev_session_reg)
-    {
-      if (prev_session_reg != ARM64_REG_INVALID)
-        gum_arm64_writer_put_mov_reg_reg (cw, session_reg, prev_session_reg);
-      else
-        gum_arm64_writer_put_ldr_reg_address (cw, session_reg, GUM_ADDRESS (&session));
-    }
-
-    if (prev_session_reg != ARM64_REG_INVALID && session_reg != prev_session_reg)
-      emit_scratch_register_restore (cw, prev_session_reg);
+    arm64_reg session_reg = gum_stalker_iterator_get_user_data_reg (iterator);
 
     if (is_first_in_block)
     {
@@ -251,6 +230,16 @@ transform (GumStalkerIterator * iterator,
 
     if (is_last_in_block)
     {
+      gboolean spill_base = session_reg != SESSION_BASE_REG;
+
+      if (spill_base)
+      {
+        gum_arm64_writer_put_str_reg_reg_offset (cw, SESSION_BASE_REG, session_reg,
+            G_STRUCT_OFFSET (ITraceSession, saved_base));
+        gum_arm64_writer_put_mov_reg_reg (cw, SESSION_BASE_REG, session_reg);
+        session_reg = SESSION_BASE_REG;
+      }
+
       gum_arm64_writer_put_stp_reg_reg_reg_offset (cw, ARM64_REG_X27, ARM64_REG_LR,
           session_reg, G_STRUCT_OFFSET (ITraceSession, saved_regs), GUM_INDEX_SIGNED_OFFSET);
       gum_arm64_writer_put_ldr_reg_address (cw, ARM64_REG_X27, block_address);
@@ -276,7 +265,11 @@ transform (GumStalkerIterator * iterator,
       gum_arm64_writer_put_ldp_reg_reg_reg_offset (cw, ARM64_REG_X27, ARM64_REG_LR,
           session_reg, G_STRUCT_OFFSET (ITraceSession, saved_regs), GUM_INDEX_SIGNED_OFFSET);
 
-      emit_scratch_register_restore (cw, session_reg);
+      if (spill_base)
+      {
+        gum_arm64_writer_put_ldr_reg_reg_offset (cw, SESSION_BASE_REG, SESSION_BASE_REG,
+            G_STRUCT_OFFSET (ITraceSession, saved_base));
+      }
     }
 #endif
 
@@ -288,16 +281,6 @@ transform (GumStalkerIterator * iterator,
     guint block_offset = (insn->address + insn->size) - block_address;
 
 #if defined (HAVE_I386)
-    for (uint8_t i = 0; i != num_regs_written; i++)
-    {
-      x86_reg reg = regs_written[i];
-      if (reg >= SCRATCH_REG_BOTTOM && reg <= SCRATCH_REG_TOP)
-      {
-        gum_x86_writer_put_mov_reg_offset_ptr_reg (cw, to_gum_reg (session_reg),
-            G_STRUCT_OFFSET (ITraceSession, scratch_regs) + SCRATCH_REG_OFFSET (reg), to_gum_reg (reg));
-      }
-    }
-
     for (uint8_t i = 0; i != num_regs_written; i++)
     {
       x86_reg reg = regs_written[i];
@@ -329,7 +312,7 @@ transform (GumStalkerIterator * iterator,
       }
 
       gsize offset = G_STRUCT_OFFSET (ITraceSession, log_buf) + log_buf_offset;
-      gum_x86_writer_put_mov_reg_offset_ptr_reg (cw, to_gum_reg (session_reg), offset, to_gum_reg (reg));
+      gum_x86_writer_put_mov_reg_offset_ptr_reg (cw, session_gum, offset, gum_x86_reg_from_capstone (reg));
 
       ITraceBlockWrite write = { block_offset, cpu_reg_index };
       g_array_append_val (writes, write);
@@ -337,17 +320,6 @@ transform (GumStalkerIterator * iterator,
       log_buf_offset += 8;
     }
 #else
-    for (uint8_t i = 0; i != num_regs_written; i++)
-    {
-      arm64_reg reg = regs_written[i];
-      gboolean is_scratch_reg = reg >= SCRATCH_REG_BOTTOM && reg <= SCRATCH_REG_TOP;
-      if (is_scratch_reg)
-      {
-        gum_arm64_writer_put_str_reg_reg_offset (cw, reg,
-            session_reg, G_STRUCT_OFFSET (ITraceSession, scratch_regs) + SCRATCH_REG_OFFSET (reg));
-      }
-    }
-
     for (uint8_t i = 0; i != num_regs_written; i++)
     {
       arm64_reg reg = regs_written[i];
@@ -432,8 +404,6 @@ transform (GumStalkerIterator * iterator,
         gum_arm64_writer_put_ldr_reg_reg_offset (cw, temp_reg, session_reg, G_STRUCT_OFFSET (ITraceSession, saved_regs));
     }
 #endif
-
-    prev_session_reg = session_reg;
   }
 
   guint32 block_size = (insn->address + insn->size) - block_address;
@@ -536,17 +506,8 @@ on_first_block_hit (GumCpuContext * cpu_context,
   session.state = ITRACE_STATE_STARTED;
 
 #if defined (HAVE_I386)
-  session.scratch_regs[SCRATCH_REG_INDEX (X86_REG_R12)] = cpu_context->r12;
-  session.scratch_regs[SCRATCH_REG_INDEX (X86_REG_R13)] = cpu_context->r13;
-  session.scratch_regs[SCRATCH_REG_INDEX (X86_REG_R14)] = cpu_context->r14;
-  session.scratch_regs[SCRATCH_REG_INDEX (X86_REG_R15)] = cpu_context->r15;
-
   guint32 num_regs = 17;
 #else
-  memcpy (session.scratch_regs,
-      cpu_context->x + (SCRATCH_REG_BOTTOM - ARM64_REG_X0),
-      sizeof (session.scratch_regs));
-
   guint32 num_regs =
       1 +                              /* pc */
       1 +                              /* sp */
@@ -649,46 +610,6 @@ panic (const char * format,
 #if defined (HAVE_I386)
 
 static x86_reg
-pick_scratch_register (cs_regs regs_read,
-                       uint8_t num_regs_read,
-                       cs_regs regs_written,
-                       uint8_t num_regs_written)
-{
-  x86_reg candidate;
-
-  for (candidate = SCRATCH_REG_TOP; candidate != SCRATCH_REG_BOTTOM - 1; candidate--)
-  {
-    gboolean available = TRUE;
-
-    for (uint8_t i = 0; i != num_regs_read; i++)
-    {
-      if (regs_read[i] == candidate)
-      {
-        available = FALSE;
-        break;
-      }
-    }
-    if (!available)
-      continue;
-
-    for (uint8_t i = 0; i != num_regs_written; i++)
-    {
-      if (regs_written[i] == candidate)
-      {
-        available = FALSE;
-        break;
-      }
-    }
-    if (!available)
-      continue;
-
-    break;
-  }
-
-  return candidate;
-}
-
-static x86_reg
 register_to_full_size_register (x86_reg reg)
 {
   switch (reg)
@@ -732,15 +653,6 @@ register_to_full_size_register (x86_reg reg)
     default:
       return reg;
   }
-}
-
-static void
-emit_scratch_register_restore (GumX86Writer * cw,
-                               x86_reg reg)
-{
-  GumX86Reg gum_reg = to_gum_reg (reg);
-  gum_x86_writer_put_mov_reg_reg_offset_ptr (cw, gum_reg,
-      gum_reg, G_STRUCT_OFFSET (ITraceSession, scratch_regs) + SCRATCH_REG_OFFSET (reg));
 }
 
 static void
@@ -863,72 +775,7 @@ emit_buffer_write_impl (GumX86Writer * cw)
   gum_x86_writer_put_bytes (cw, write_impl, sizeof (write_impl));
 }
 
-static GumX86Reg
-to_gum_reg (x86_reg reg)
-{
-  switch (reg)
-  {
-    case X86_REG_RAX: return GUM_X86_RAX;
-    case X86_REG_RCX: return GUM_X86_RCX;
-    case X86_REG_RDX: return GUM_X86_RDX;
-    case X86_REG_RBX: return GUM_X86_RBX;
-    case X86_REG_RSP: return GUM_X86_RSP;
-    case X86_REG_RBP: return GUM_X86_RBP;
-    case X86_REG_RSI: return GUM_X86_RSI;
-    case X86_REG_RDI: return GUM_X86_RDI;
-    case X86_REG_R8:  return GUM_X86_R8;
-    case X86_REG_R9:  return GUM_X86_R9;
-    case X86_REG_R10: return GUM_X86_R10;
-    case X86_REG_R11: return GUM_X86_R11;
-    case X86_REG_R12: return GUM_X86_R12;
-    case X86_REG_R13: return GUM_X86_R13;
-    case X86_REG_R14: return GUM_X86_R14;
-    case X86_REG_R15: return GUM_X86_R15;
-    default:          return GUM_X86_NONE;
-  }
-}
-
 #elif defined (HAVE_ARM64)
-
-static arm64_reg
-pick_scratch_register (cs_regs regs_read,
-                       uint8_t num_regs_read,
-                       cs_regs regs_written,
-                       uint8_t num_regs_written)
-{
-  arm64_reg candidate;
-
-  for (candidate = SCRATCH_REG_TOP; candidate != SCRATCH_REG_BOTTOM - 1; candidate--)
-  {
-    gboolean available = TRUE;
-
-    for (uint8_t i = 0; i != num_regs_read; i++)
-    {
-      if (regs_read[i] == candidate)
-      {
-        available = FALSE;
-        break;
-      }
-    }
-    if (!available)
-      continue;
-
-    for (uint8_t i = 0; i != num_regs_written; i++)
-    {
-      if (regs_written[i] == candidate)
-      {
-        available = FALSE;
-        break;
-      }
-    }
-    if (!available)
-      continue;
-
-    break;
-  }
-
-  return candidate;
-}
 
 static arm64_reg
 register_to_full_size_register (arm64_reg reg)
@@ -967,14 +814,6 @@ register_to_full_size_register (arm64_reg reg)
     return ARM64_REG_Q0 + (reg - ARM64_REG_B0);
 
   return reg;
-}
-
-static void
-emit_scratch_register_restore (GumArm64Writer * cw,
-                               arm64_reg reg)
-{
-  gum_arm64_writer_put_ldr_reg_reg_offset (cw, reg,
-      reg, G_STRUCT_OFFSET (ITraceSession, scratch_regs) + SCRATCH_REG_OFFSET (reg));
 }
 
 static void
