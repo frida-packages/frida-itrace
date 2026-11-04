@@ -33,12 +33,13 @@ export class TraceSession {
     events = new EventEmitter() as TypedEmitter<TraceSessionEvents>;
 
     #cm: CModule;
+    #nativeSession: NativePointer;
     #threadId: number | undefined;
     #listener: InvocationListener | undefined;
 
     constructor(public strategy: TraceStrategy, public buffer: TraceBuffer) {
-        const nativeSession = Memory.alloc(16384);
-        nativeSession.add(POINTER_SIZE).writePointer(buffer.regionBase);
+        this.#nativeSession = Memory.alloc(16400);
+        this.#nativeSession.add(POINTER_SIZE).writePointer(buffer.regionBase);
 
         const endBuf = Memory.alloc(POINTER_SIZE);
         if (strategy.type === "range") {
@@ -46,7 +47,7 @@ export class TraceSession {
         }
 
         this.#cm = new CModule(backend.code, {
-            session: nativeSession,
+            session: this.#nativeSession,
             end_address: endBuf,
             on_end: new NativeCallback(this.#onEnd, "void", []),
         });
@@ -81,6 +82,7 @@ export class TraceSession {
         this.#threadId = threadId;
         Stalker.follow(threadId, {
             transform: this.#cm.transform,
+            data: this.#nativeSession,
         });
     }
 
