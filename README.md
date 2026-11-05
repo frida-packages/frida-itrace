@@ -32,6 +32,13 @@ setInterval(() => {
 }, 10);
 ```
 
+## Compatibility
+
+Version 7 and later use Stalker's user data register, so they require a Frida
+build that provides `getUserDataReg()` on Stalker iterators. Tracers built
+against older versions crash on arm64 with such builds, so upgrade frida-itrace
+together with Frida.
+
 ## Buffer format
 
 All data — both trace records and metadata events — is delivered
